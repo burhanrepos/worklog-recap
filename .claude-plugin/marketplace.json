@@ -1,0 +1,16 @@
+{
+  "name": "wlog",
+  "owner": {
+    "name": "Burhan Shaheen"
+  },
+  "plugins": [
+    {
+      "name": "wlog",
+      "source": "./",
+      "description": "Work log from your Claude Code chats and git commits, with a 1-page PDF for reviews."
+    }
+  ],
+  "metadata": {
+    "description": "wlog: a Claude Code plugin that builds your work log from your chats and git commits."
+  }
+}

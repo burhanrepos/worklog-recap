@@ -6,7 +6,9 @@ Run it from inside the repo. Data: ~/.claude/worklog/<repo>/ (config.json, entri
   worklog.py install               standalone skill only: add the commit hook and logging rule to ~/.claude (the plugin ships its own hooks)
   worklog.py status                is this repo set up, how many entries, what is configured
   worklog.py add '<json>'          append one entry (fields below); prints its id
-  worklog.py list [PERIOD]         entries, one line each (default: last 14 days)
+  worklog.py list [PERIOD]         entries, one line each with id and project (default: last 14 days)
+  worklog.py projects              project names in use, with entry counts
+  worklog.py project NAME ID...    put entries under one project (e.g. "Notifications")
   worklog.py commits [--since DATE]   import your commits from git into commits.jsonl
   worklog.py extract [--all]       write compact digests of chats not scanned yet to the digest folder
   worklog.py mark-scanned          after entries from the digests are added, remember them as scanned
@@ -19,7 +21,7 @@ Run it from inside the repo. Data: ~/.claude/worklog/<repo>/ (config.json, entri
 PERIOD: week | month | quarter | year | all | YYYY-MM | FROM [TO] (dates as YYYY-MM-DD). Default for pdf: all.
 
 Entry fields: date (YYYY-MM-DD), end (optional), type (feature|fix|debugging|investigation|tooling), title,
-ticket (e.g. ABC-123, or ""), what, why, outcome, evidence (list: commits, PRs, who was told), env (optional),
+project (feature area, e.g. "Notifications"), ticket (e.g. ABC-123, or ""), what, why, outcome, evidence (list: commits, PRs, who was told), env (optional),
 handed_to (optional), status (done|pending|handed-off), source (chat id or "commit").
 """
 import collections
@@ -46,6 +48,7 @@ TYPES = {
 }
 TICKET = re.compile(r"\b[A-Z][A-Z0-9]{1,9}-\d{1,6}\b")
 SECRET = re.compile(r"(eyJ[\w-]{20,}\.[\w-]+\.[\w-]+|(?i:bearer)\s+\S+|AKIA[0-9A-Z]{16}|-----BEGIN[^-]+-----[\s\S]*?-----END[^-]+-----)")
+OTHER = "Other work"
 NOISE = re.compile(r"^(merge|backsync|index on|revert \"merge)|conflict|yarn\.lock|package-lock|lint issue", re.I)
 
 
@@ -180,8 +183,10 @@ def init():
 
 RULE = ("After finishing any piece of work worth mentioning in a performance review (feature step, bug fix, env/production debugging "
         "for another team, investigation or report for the lead, tooling or help for teammates), log it from the repo folder: "
-        "`python3 -I \"{me}\" add '<json>'` (fields and types in the worklog skill's SKILL.md). It does nothing in repos without a work log. "
-        "Log ticketed and unticketed work alike. One entry per distinct piece of work, plain words, what / why / outcome, no secrets. "
+        "`python3 -I \"{me}\" add '<json>'` with fields date, type (feature|fix|debugging|investigation|tooling), title, project, ticket, "
+        "what, why, outcome, evidence (list), status (done|pending|handed-off); no need to read SKILL.md. It does nothing in repos without a work log. "
+        "Log ticketed and unticketed work alike. Set `project` to the feature area (reuse a name from `python3 -I \"{me}\" projects`, e.g. \"Notifications\"). "
+        "One entry per distinct piece of work; fold small follow-ups into the existing entry instead. Plain words, what / why / outcome, no secrets. "
         "Do it at the end of the task and say so in one short line (\"Logged to work log.\"). Skip trivial questions and explanations. "
         "Log only the user's own impactful work: skip merges, rebases, backsyncs, conflict or build fixes caused by someone else's PR, "
         "test data seeding, personal local setup, self code-review passes and one-line tweaks.")
@@ -292,7 +297,27 @@ def list_entries(args):
     hidden = set(repo.config.get("hidden", []))
     for e in sorted(read_jsonl(repo.entries), key=lambda x: x["date"]):
         if start <= e["date"] <= end:
-            print(f"{e['date']}  {e['type']:<13} {e.get('ticket') or 'no ticket':<10} {e['title']}{'  (hidden)' if e['id'] in hidden else ''}")
+            print(f"{e['id']}  {e['date']}  {e['type']:<13} {(e.get('project') or '-')[:24]:<24} {e.get('ticket') or 'no ticket':<10} {e['title']}{'  (hidden)' if e['id'] in hidden else ''}")
+
+
+def list_projects():
+    # One line per project name: cheap for Claude to read before every add, unlike `list all`.
+    counts = collections.Counter(e.get("project") or "-" for e in read_jsonl(Repo().need().entries))
+    for name, n in counts.most_common():
+        print(f"{n:>3}  {name}")
+
+
+def set_project(name, ids):
+    repo = Repo().need()
+    rows = read_jsonl(repo.entries)
+    hit = 0
+    for e in rows:
+        if e["id"] in ids:
+            e["project"] = name
+            hit += 1
+    with open(repo.entries, "w", encoding="utf-8") as f:
+        f.writelines(json.dumps(e, ensure_ascii=False) + "\n" for e in rows)
+    print(f"{hit} entries now under {name}")
 
 
 def record_commit(repo, sha, cwd):
@@ -354,17 +379,25 @@ def text_of(content):
     return ""
 
 
+def clip(t, n):
+    return t if len(t) <= n else t[:n] + "…"
+
+
+BATCH_BYTES = 60_000  # ~15k tokens: one subagent reads one batch
+
+
 def extract(all_chats=False):
-    """Compact digest per chat: user messages + Claude's replies, trimmed, secrets masked, from the last scanned line."""
+    """Compact digests: each user message + Claude's final reply to it, trimmed, secrets masked, from the last scanned line.
+    Claude's in-between narration is dropped (the final reply says what was done). Chats are packed into batch-N.txt files."""
     repo = Repo().need()
     state = {} if all_chats or not os.path.exists(repo.state) else json.load(open(repo.state))
     os.makedirs(repo.digests, exist_ok=True)
     for old in glob.glob(os.path.join(repo.digests, "*.txt")):
         os.remove(old)
-    pending = {}
+    pending, chats = {}, []
     for path in sorted(glob.glob(repo.chat_glob())):
         start = state.get(path, 0)
-        lines, n = [], 0
+        lines, reply, n = [], None, 0
         with open(path, encoding="utf-8", errors="ignore") as f:
             for n, line in enumerate(f, 1):
                 if n <= start:
@@ -377,18 +410,33 @@ def extract(all_chats=False):
                 if kind not in ("user", "assistant") or o.get("isMeta"):
                     continue
                 t = text_of(o.get("message", {}).get("content")).strip()
-                if not t or t.startswith("<") or "This session is being continued" in t[:80]:
+                if not t or t.startswith(("<", "[Request interrupted")) or "This session is being continued" in t[:80]:
                     continue
                 t = SECRET.sub("[redacted]", re.sub(r"\s+", " ", t))
-                lines.append(f"{(o.get('timestamp') or '')[:16]} {'ME' if kind == 'user' else 'CLAUDE'}: {t[:500 if kind == 'user' else 700]}")
+                if kind == "assistant":
+                    reply = t  # only the last reply before the next user message is kept
+                    continue
+                if reply:
+                    lines.append(f"CLAUDE: {clip(reply, 400)}")
+                    reply = None
+                lines.append(f"{(o.get('timestamp') or '')[:10]} ME: {clip(t, 300)}")
+        if reply:
+            lines.append(f"CLAUDE: {clip(reply, 400)}")
         if lines:
-            name = os.path.basename(path)[:-6]
-            with open(os.path.join(repo.digests, f"{name}.txt"), "w", encoding="utf-8") as f:
-                f.write(f"# chat {name} ({os.path.basename(os.path.dirname(path))})\n" + "\n".join(lines))
+            chats.append(f"# chat {os.path.basename(path)[:-6]}\n" + "\n".join(lines) + "\n\n")
         pending[path] = n
     json.dump(pending, open(os.path.join(repo.data, "scan-pending.json"), "w"))
-    files = glob.glob(os.path.join(repo.digests, "*.txt"))
-    print(f"{len(files)} chats with new messages, {sum(os.path.getsize(f) for f in files) // 1024} KB of digests in {repo.digests}")
+    batches = [""]
+    for c in chats:
+        if batches[-1] and len(batches[-1]) + len(c) > BATCH_BYTES:
+            batches.append("")
+        batches[-1] += c
+    for i, b in enumerate(filter(None, batches), 1):
+        with open(os.path.join(repo.digests, f"batch-{i}.txt"), "w", encoding="utf-8") as f:
+            f.write(b)
+    files = sorted(glob.glob(os.path.join(repo.digests, "*.txt")))
+    print(f"{len(chats)} chats with new messages, {sum(map(len, chats)) // 1024} KB in {len(files)} batch files:")
+    print("\n".join(files))
 
 
 def mark_scanned():
@@ -407,7 +455,7 @@ def mark_scanned():
 
 PAGE = r"""<title>__TITLE__</title><meta name="claude:viewport-fit-sides" content="cover">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=IBM+Plex+Mono:wght@500;700&display=swap"><style>
-/* Layout: ink header band with the totals, category tiles, projects, highlights, then a filterable list of work */
+/* Layout: ink header band with the totals, category tiles, projects, highlights, then the work grouped by project */
 :root{--bg:#f4f5f8;--surface:#fff;--ink:#141a26;--mute:#5d6678;--line:#e1e5ec;--soft:#eef1f6;--band:#141a26;--band-ink:#f4f5f8;
  --feature:#2457c5;--fix:#0d7f57;--debugging:#c4450f;--investigation:#6d3bb5;--tooling:#9a6a12;--tk-bg:#e6edfb;--tk:#2457c5;--warn-bg:#fff2cf;--warn:#8a6100;
  --sans:"IBM Plex Sans","Segoe UI",system-ui,sans-serif;--mono:"IBM Plex Mono",ui-monospace,monospace}
@@ -445,6 +493,8 @@ summary .t{flex:1 1 260px;min-width:0;font-weight:600}.d{color:var(--mute);font-
 .tk{font:700 11px var(--mono);background:var(--tk-bg);color:var(--tk);border-radius:5px;padding:1px 6px;white-space:nowrap}
 .body{padding:0 12px 10px 27px;font-size:13.5px}.body p{margin:3px 0}.body .r{background:var(--soft);border-radius:6px;padding:5px 8px}
 .ev{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}.ev span{font-size:11.5px;color:var(--mute);background:var(--soft);border-radius:10px;padding:0 8px;overflow-wrap:anywhere}
+.grp h3{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline;font-size:16px;margin:18px 0 6px;padding-bottom:4px;border-bottom:2px solid var(--line)}
+.grp h3 .t{flex:1 1 240px}.grp h4{font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--mute);margin:8px 0 4px}.grp h4 b{font-family:var(--mono);color:var(--ink)}
 .st{font-size:11px;font-weight:700;border-radius:4px;padding:0 5px;background:var(--warn-bg);color:var(--warn)}
 @media (max-width:640px){.cards{grid-template-columns:repeat(2,1fr)}.hl{grid-template-columns:1fr}}
 @media (prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
@@ -454,6 +504,7 @@ summary .t{flex:1 1 260px;min-width:0;font-weight:600}.d{color:var(--mute);font-
  .card,.h,.p{break-inside:avoid}.hero{padding:14px 16px}.nums{margin-top:10px}.nums b{font-size:22px}h2{margin:12px 0 6px}
  .h{padding:5px 9px}.h b{font-size:11.5px}.h small{font-size:10px;margin:0}.h small:nth-of-type(1){display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden}.p{font-size:11px;padding:2px 9px}
  body.short #list,body.short #listh{display:none}#listh{break-before:page}
+ .grp h3,.grp h4{break-after:avoid}.grp h3{font-size:13px;margin:10px 0 4px}
  details{border-radius:0;border-width:0 0 1px 3px;margin:0}summary{padding:3px 8px}details:not([open]) .body{display:none}}
 </style><main class="__MODE__">
 <div class="hero"><h1>What I worked on</h1><p>__WHO__ · __REPO__ · __SPAN__</p><div class="nums" id="nums"></div></div>
@@ -462,7 +513,7 @@ summary .t{flex:1 1 260px;min-width:0;font-weight:600}.d{color:var(--mute);font-
 <h2>Highlights</h2><div class="hl" id="hl"></div>
 <div class="tools"><input id="q" placeholder="Search work, tickets, tech…"><button class="btn" id="exp">Expand all</button>
 <button class="btn pdfbtn" id="pdf1">PDF: 1 page</button><button class="btn pri pdfbtn" id="pdf2">PDF: with list</button></div>
-<h2 id="listh">All work</h2><div class="count" id="count"></div><div id="list"></div>
+<h2 id="listh">All work, by project</h2><div class="count" id="count"></div><div id="list"></div>
 </main><script>
 const D=__DATA__,TYPES=__TYPES__,JIRA="__JIRA__";
 const $=s=>document.querySelector(s),esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"})[c]);
@@ -471,25 +522,35 @@ const when=e=>md(e.date)+(e.end&&e.end!==e.date?" – "+md(e.end):"");
 const tks=s=>(s||"").match(/[A-Z]+-\d+/g)||[];
 const chips=s=>tks(s).map(t=>JIRA?`<a class="tk" href="${JIRA}${t}" target="_blank" onclick="event.stopPropagation()">${t}</a>`:`<span class="tk">${t}</span>`).join(" ");
 const first=(s,n)=>String(s||"").trim().split(/(?<=[.!?])\s+/).slice(0,n).join(" ");
-let type=null,ticket=null;
+const BUCKETS=[["Features",["feature"]],["Bug fixes",["fix"]],["Miscellaneous",["debugging","investigation","tooling"]]];
+const end=e=>e.end||e.date;
+let type=null,proj=null;
 const allT=[...new Set(D.entries.flatMap(e=>tks(e.ticket)))];
 $("#nums").innerHTML=[[D.entries.length,"pieces of work"],...(D.commits?[[D.commits,"commits"]]:[]),[allT.length,"tickets"],[D.entries.filter(e=>!e.ticket).length,"done outside tickets"],[D.entries.filter(e=>e.type==="debugging").length,"issues debugged"]].map(([n,l])=>`<div><b>${n}</b><span>${l}</span></div>`).join("");
 $("#cards").innerHTML=Object.entries(TYPES).map(([k,l])=>`<button class="card" data-t="${k}" style="--c:var(--${k})"><b>${D.entries.filter(e=>e.type===k).length}</b><span>${l}</span></button>`).join("");
-if(!Object.keys(D.projects).length){$("#projh").hidden=true;$("#proj").hidden=true}
+const counts={};D.entries.forEach(e=>{if(e.project!==D.other)counts[e.project]=(counts[e.project]||0)+1});
+const projs=Object.entries(counts).filter(x=>x[1]>1).sort((a,b)=>b[1]-a[1]);
+if(!projs.length){$("#projh").hidden=true;$("#proj").hidden=true}
 const byId=Object.fromEntries(D.entries.map(e=>[e.id,e]));
 $("#hl").innerHTML=D.highlights.map(i=>byId[i]).filter(Boolean).map(e=>`<div class="h" data-id="${e.id}" style="--c:var(--${e.type})"><b>${esc(e.title)}</b><small>${esc(first(e.outcome,1))}</small><small>${chips(e.ticket)} ${when(e)}</small></div>`).join("");
-$("#proj").innerHTML=Object.entries(D.projects).map(([t,n])=>[t,n,D.entries.filter(e=>tks(e.ticket).includes(t)).length]).filter(x=>x[2]).map(([t,n,c])=>`<span class="p" data-k="${t}"><b>${c}</b> ${esc(n)} · ${t}</span>`).join("");
-function render(){const q=$("#q").value.toLowerCase();
- const rows=D.entries.filter(e=>(!type||e.type===type)&&(!ticket||tks(e.ticket).includes(ticket))&&(!q||JSON.stringify(e).toLowerCase().includes(q))).reverse();
- $("#count").textContent=`${rows.length} of ${D.entries.length} shown · click a row for details`;
- $("#list").innerHTML=rows.map(e=>`<details id="e-${e.id}" style="--c:var(--${e.type})"><summary><i class="dot"></i><span class="t">${esc(e.title)}</span>${e.status&&e.status!=="done"?`<span class="st ${e.status}">${e.status}</span>`:""}${chips(e.ticket)}<span class="d">${when(e)}</span></summary>
+$("#proj").innerHTML=projs.map(([n,c])=>`<span class="p" data-k="${esc(n)}"><b>${c}</b> ${esc(n)}</span>`).join("");
+const row=e=>`<details id="e-${e.id}" style="--c:var(--${e.type})"><summary><i class="dot"></i><span class="t">${esc(e.title)}</span>${e.status&&e.status!=="done"?`<span class="st ${e.status}">${e.status}</span>`:""}${chips(e.ticket)}<span class="d">${when(e)}</span></summary>
  <div class="body">${e.outcome?`<p class="r"><b>Result:</b> ${esc(first(e.outcome,2))}</p>`:""}${e.what?`<p><b>Did:</b> ${esc(first(e.what,2))}</p>`:""}${e.why?`<p><b>Why:</b> ${esc(first(e.why,1))}</p>`:""}
- ${(e.evidence||[]).length?`<div class="ev">${e.evidence.slice(0,5).map(x=>`<span>${esc(x)}</span>`).join("")}</div>`:""}</div></details>`).join("");
+ ${(e.evidence||[]).length?`<div class="ev">${e.evidence.slice(0,5).map(x=>`<span>${esc(x)}</span>`).join("")}</div>`:""}</div></details>`;
+function render(){const q=$("#q").value.toLowerCase();
+ const rows=D.entries.filter(e=>(!type||e.type===type)&&(!proj||e.project===proj)&&(!q||JSON.stringify(e).toLowerCase().includes(q)));
+ $("#count").textContent=`${rows.length} of ${D.entries.length} shown · click a row for details`;
+ const groups={};rows.forEach(e=>(groups[e.project]??=[]).push(e));
+ const last=g=>g.map(end).sort().pop();
+ const order=Object.keys(groups).sort((a,b)=>(a===D.other)-(b===D.other)||last(groups[b]).localeCompare(last(groups[a])));
+ $("#list").innerHTML=order.map(p=>{const g=groups[p];
+  return `<section class="grp"><h3><span class="t">${esc(p)}</span>${chips([...new Set(g.flatMap(e=>tks(e.ticket)))].join(" "))}<span class="d">${g.length} item${g.length>1?"s":""} · ${md(g[0].date)} – ${md(last(g))}</span></h3>`
+   +BUCKETS.map(([l,ts])=>{const b=g.filter(e=>ts.includes(e.type)).reverse();return b.length?`<h4>${l} <b>${b.length}</b></h4>${b.map(row).join("")}`:""}).join("")+`</section>`}).join("");
  document.querySelectorAll(".card").forEach(c=>c.classList.toggle("on",c.dataset.t===type));
- document.querySelectorAll(".p").forEach(c=>c.classList.toggle("on",c.dataset.k===ticket));}
+ document.querySelectorAll(".p").forEach(c=>c.classList.toggle("on",c.dataset.k===proj));}
 $("#cards").onclick=ev=>{const c=ev.target.closest(".card");if(c){type=type===c.dataset.t?null:c.dataset.t;render();$("#listh").scrollIntoView({behavior:"smooth"})}};
-$("#proj").onclick=ev=>{const c=ev.target.closest(".p");if(c){ticket=ticket===c.dataset.k?null:c.dataset.k;render();$("#listh").scrollIntoView({behavior:"smooth"})}};
-$("#hl").onclick=ev=>{const h=ev.target.closest(".h");if(!h)return;type=ticket=null;$("#q").value="";render();const d=$("#e-"+h.dataset.id);d.open=true;d.scrollIntoView({behavior:"smooth",block:"center"})};
+$("#proj").onclick=ev=>{const c=ev.target.closest(".p");if(c){proj=proj===c.dataset.k?null:c.dataset.k;render();$("#listh").scrollIntoView({behavior:"smooth"})}};
+$("#hl").onclick=ev=>{const h=ev.target.closest(".h");if(!h)return;type=proj=null;$("#q").value="";render();const d=$("#e-"+h.dataset.id);d.open=true;d.scrollIntoView({behavior:"smooth",block:"center"})};
 $("#q").oninput=render;
 $("#exp").onclick=()=>{const all=[...document.querySelectorAll("details")],o=!all.every(d=>d.open);all.forEach(d=>d.open=o);$("#exp").textContent=o?"Collapse all":"Expand all"};
 const print=s=>{document.body.classList.toggle("short",s);window.print()};
@@ -516,18 +577,10 @@ def auto_highlights(entries):
     return [e["id"] for e in sorted(newest, key=lambda e: (rank[e["type"]], not e.get("ticket")))[:10]]
 
 
-def auto_projects(entries):
-    """Without hand-named projects: every ticket with 2+ entries, named after its first feature (or first) entry."""
-    by_ticket = collections.defaultdict(list)
-    for e in entries:
-        for t in TICKET.findall(e.get("ticket") or ""):
-            by_ticket[t].append(e)
-    out = {}
-    for t, items in sorted(by_ticket.items(), key=lambda x: -len(x[1])):
-        if len(items) >= 2:
-            named = next((e for e in items if e["type"] == "feature"), items[0])
-            out[t] = named["title"]
-    return out
+def project_of(e, names):
+    """Entry's own project, else the name given to its ticket in config, else the ticket id, else Other work."""
+    tickets = TICKET.findall(e.get("ticket") or "")
+    return e.get("project") or next((names[t] for t in tickets if t in names), None) or (tickets[0] if tickets else OTHER)
 
 
 def pdf(args):
@@ -540,8 +593,9 @@ def pdf(args):
     commits = list({c["sha"][:9]: c for c in read_jsonl(repo.commits)
                     if start <= c["date"] <= end and not NOISE.search(c["subject"])}.values())
     keep = ("id", "type", "date", "end", "title", "ticket", "what", "why", "outcome", "evidence", "status", "env", "handed_to")
-    data = {"entries": [{k: e.get(k) for k in keep} for e in entries], "commits": len(commits),
-            "highlights": cfg.get("highlights") or auto_highlights(entries), "projects": cfg.get("projects") or auto_projects(entries)}
+    names = cfg.get("projects") or {}
+    data = {"entries": [{**{k: e.get(k) for k in keep}, "project": project_of(e, names)} for e in entries], "commits": len(commits),
+            "highlights": cfg.get("highlights") or auto_highlights(entries), "other": OTHER}
     fmt_date = lambda d: (lambda x: f"{x:%b} {x.day}, {x.year}")(dt.date.fromisoformat(d))
     who = cfg.get("name") or "My"
     labels = {"feature": "Features", "fix": "Fixes", "debugging": "Debugging", "investigation": "Investigations", "tooling": "Tooling & help"}
@@ -584,6 +638,10 @@ if __name__ == "__main__":
         status()
     elif cmd == "add" and rest:
         add(rest[0])
+    elif cmd == "projects":
+        list_projects()
+    elif cmd == "project" and len(rest) >= 2:
+        set_project(rest[0], set(rest[1:]))
     elif cmd == "list":
         list_entries(rest)
     elif cmd == "session-context":

@@ -186,7 +186,7 @@ RULE = ("After finishing any piece of work worth mentioning in a performance rev
         "`python3 -I \"{me}\" add '<json>'` with fields date, type (feature|fix|debugging|investigation|tooling), title, project, ticket, "
         "what, why, outcome, evidence (list), status (done|pending|handed-off); no need to read SKILL.md. It does nothing in repos without a work log. "
         "Log ticketed and unticketed work alike. Set `project` to the feature area (reuse a name from `python3 -I \"{me}\" projects`, e.g. \"Notifications\"). "
-        "One entry per distinct piece of work; fold small follow-ups into the existing entry instead. Plain words, what / why / outcome, no secrets. "
+        "One entry per feature: sub-tasks, follow-up fixes, reviews, docs and tests of a feature go into that feature's existing entry (add a merged entry with the new text and date range, hide the old one), never a new line each. Plain words, what / why / outcome, no secrets. "
         "Do it at the end of the task and say so in one short line (\"Logged to work log.\"). Skip trivial questions and explanations. "
         "Log only the user's own impactful work: skip merges, rebases, backsyncs, conflict or build fixes caused by someone else's PR, "
         "test data seeding, personal local setup, self code-review passes and one-line tweaks.")

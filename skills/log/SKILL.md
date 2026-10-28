@@ -66,7 +66,7 @@ One entry = one piece of work the user could mention in a review. Add with `work
 - `what` / `why` / `outcome`: one or two plain sentences each. Say the impact (who was blocked, what now works).
 - `evidence`: commits, PRs, ticket ids, who was told. Never secrets, tokens, env values or customer data.
 - Only the user's own impactful work. Skip merges, rebases, backsyncs, conflict or build fixes caused by someone else's PR, test data seeding, personal local setup, self code-review passes and one-line tweaks.
-- One entry per distinct piece of work. Several commits or chats on the same thing → one entry with a date range (`end`). Small follow-up fixes to a feature you already logged go into that entry (add a new one with the merged text and hide the old), not a new line each.
+- **One entry per feature.** Everything about a feature (sub-tasks, follow-up fixes, reviews, docs, tests, feature-specific investigations) lives in that feature's one entry with a date range (`end`). When new work touches a feature already logged, add a merged entry with the updated text and range and hide the old one; never a new line per sub-task. A few months of work is a few features, not dozens. Separate entries only for env/production debugging, reports for the lead, tooling, and unrelated small fixes.
 
 ## Report config (`~/.claude/worklog/<repo>/config.json`)
 

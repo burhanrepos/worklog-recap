@@ -40,9 +40,11 @@ Tested on Linux. macOS paths for Chrome and Edge are supported. Windows is untes
 In Claude Code:
 
 ```
-/plugin marketplace add burhanrepos/worklog-recap
-/plugin install wlog@wlog
+/plugin marketplace add burhanrepos/claude-plugins
+/plugin install wlog@burhanrepos
 ```
+
+wlog is part of [claude-plugins](https://github.com/burhanrepos/claude-plugins). The older single-plugin marketplace (`/plugin marketplace add burhanrepos/worklog-recap`, then `/plugin install wlog@wlog`) still works.
 
 Restart Claude Code, open any git repository, and run:
 
@@ -155,8 +157,10 @@ Everything is in this repository as readable Python (standard library only). No 
 ## Uninstall
 
 ```
-/plugin uninstall wlog@wlog
+/plugin uninstall wlog@burhanrepos
 ```
+
+If you installed from the older marketplace, use `wlog@wlog` instead.
 
 The hooks go away with the plugin. Your data stays in `~/.claude/worklog/` until you delete it.
 

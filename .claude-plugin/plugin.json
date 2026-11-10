@@ -1,10 +1,18 @@
 {
   "name": "wlog",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "Never forget what you worked on. Builds a work log from your Claude Code chats and your own git commits, with a 1-page PDF and a shareable page.",
-  "author": { "name": "Burhan Shaheen" },
-  "homepage": "https://github.com/burhanrepos/worklog-recap",
+  "author": {
+    "name": "Burhan Shaheen"
+  },
+  "homepage": "https://github.com/burhanrepos/claude-plugins/tree/main/plugins/worklog",
   "repository": "https://github.com/burhanrepos/worklog-recap",
   "license": "MIT",
-  "keywords": ["worklog", "performance-review", "standup", "productivity", "git"]
+  "keywords": [
+    "worklog",
+    "performance-review",
+    "standup",
+    "productivity",
+    "git"
+  ]
 }
